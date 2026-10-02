@@ -10,7 +10,7 @@ from psycopg.types.json import Jsonb
 
 from src.config import (
     MUJI_API_URL,
-    MUJI_CATEGORY_ID,
+    MUJI_CATEGORIES,
     MUJI_DISPLAY_SIZE,
     REQUEST_DELAY,
     REQUEST_HEADERS,
@@ -26,13 +26,9 @@ from src.db import get_connection
 
 def fetch_page(category_id: int, page: int) -> dict:
     """
-    MUJI API에서 특정 페이지의 상품 데이터를 가져온다.
+    MUJI API에서 특정 카테고리의 특정 페이지를 가져온다.
 
     요청 실패 시 지수 백오프 방식으로 자동 재시도한다.
-    예:
-        1차 실패 -> 1초 대기
-        2차 실패 -> 2초 대기
-        3차 실패 -> 최종 실패
     """
 
     params = {
@@ -68,7 +64,6 @@ def fetch_page(category_id: int, page: int) -> dict:
             ValueError,
             RuntimeError,
         ) as error:
-
             last_error = error
 
             if attempt < REQUEST_MAX_RETRIES - 1:
@@ -76,6 +71,7 @@ def fetch_page(category_id: int, page: int) -> dict:
 
                 print(
                     "[재시도] "
+                    f"category_id={category_id}, "
                     f"page={page}, "
                     f"attempt={attempt + 1}, "
                     f"delay={delay}s"
@@ -222,7 +218,6 @@ def fetch_pages_concurrent(
     results = {}
 
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
-
         future_to_page = {
             executor.submit(
                 fetch_page,
@@ -238,11 +233,14 @@ def fetch_pages_concurrent(
             try:
                 results[page] = future.result()
 
-                print("[동시 수집] " f"page={page}")
+                print("[동시 수집] " f"category_id={category_id}, " f"page={page}")
 
             except Exception as error:
                 raise RuntimeError(
-                    f"페이지 수집 실패 page={page}: " f"{error}"
+                    "페이지 수집 실패 "
+                    f"category_id={category_id}, "
+                    f"page={page}: "
+                    f"{error}"
                 ) from error
 
     return results
@@ -254,7 +252,7 @@ def fetch_pages_concurrent(
 
 
 def compare_collection_speed(
-    category_id: int = MUJI_CATEGORY_ID,
+    category_id: int,
     test_pages: int = 10,
     max_workers: int = 5,
 ) -> dict:
@@ -273,12 +271,12 @@ def compare_collection_speed(
 
     print()
     print("=" * 60)
-    print("순차 / 동시 수집 성능 비교")
+    print("순차 / 동시 수집 성능 비교 " f"- category_id={category_id}")
     print("=" * 60)
 
-    # ------------------------------
+    # --------------------------------------------------------
     # 순차 수집
-    # ------------------------------
+    # --------------------------------------------------------
 
     print()
     print("[순차 수집 시작]")
@@ -294,9 +292,9 @@ def compare_collection_speed(
 
     print("[순차 수집 완료] " f"{sequential_time:.2f}초")
 
-    # ------------------------------
+    # --------------------------------------------------------
     # 동시 수집
-    # ------------------------------
+    # --------------------------------------------------------
 
     print()
     print("[동시 수집 시작]")
@@ -313,9 +311,9 @@ def compare_collection_speed(
 
     print("[동시 수집 완료] " f"{concurrent_time:.2f}초")
 
-    # ------------------------------
+    # --------------------------------------------------------
     # 결과 검증
-    # ------------------------------
+    # --------------------------------------------------------
 
     if len(sequential_results) != len(concurrent_results):
         raise RuntimeError("순차/동시 수집 결과의 페이지 수가 다릅니다.")
@@ -327,15 +325,14 @@ def compare_collection_speed(
     print("성능 비교 결과")
     print("=" * 60)
 
+    print(f"카테고리 ID   : {category_id}")
     print(f"테스트 페이지 : {test_pages}")
-
     print(f"순차 수집     : {sequential_time:.2f}초")
-
     print(f"동시 수집     : {concurrent_time:.2f}초")
-
     print(f"속도 향상     : {speedup:.2f}배")
 
     return {
+        "category_id": category_id,
         "test_pages": test_pages,
         "max_workers": max_workers,
         "sequential_time": round(
@@ -354,16 +351,16 @@ def compare_collection_speed(
 
 
 # ============================================================
-# 7. 실제 Extract
+# 7. 단일 카테고리 Extract
 # ============================================================
 
 
 def extract_category(
-    category_id: int = MUJI_CATEGORY_ID,
+    category_id: int,
     max_workers: int = 5,
 ) -> dict:
     """
-    MUJI 생활 카테고리 전체 상품을 수집한다.
+    전달받은 MUJI 카테고리의 전체 상품을 수집한다.
 
     첫 페이지:
         전체 페이지 수 확인을 위해 먼저 요청
@@ -375,9 +372,18 @@ def extract_category(
         PostgreSQL muji_raw 테이블에 저장
     """
 
+    category_name = MUJI_CATEGORIES.get(
+        category_id,
+        "알 수 없음",
+    )
+
     batch_id = str(uuid.uuid4())
 
-    print("[Extract 시작] " f"batch_id={batch_id}")
+    print()
+    print("=" * 60)
+    print("[Extract 시작] " f"{category_name} " f"(category_id={category_id})")
+    print(f"batch_id={batch_id}")
+    print("=" * 60)
 
     started_at = time.perf_counter()
 
@@ -403,7 +409,7 @@ def extract_category(
 
     response_category_name = category_info.get("name")
 
-    print("[요청 카테고리] " f"{category_id}")
+    print("[요청 카테고리] " f"{category_id} {category_name}")
 
     print("[응답 카테고리] " f"{response_category_id} " f"{response_category_name}")
 
@@ -424,13 +430,18 @@ def extract_category(
         response_data=first_response,
     )
 
-    print(f"[저장] 1/{last_page}")
+    print(f"[저장] " f"{category_name} " f"1/{last_page}")
 
     # --------------------------------------------------------
     # 2페이지 이후 동시 수집
     # --------------------------------------------------------
 
-    pages = list(range(2, last_page + 1))
+    pages = list(
+        range(
+            2,
+            last_page + 1,
+        )
+    )
 
     responses = fetch_pages_concurrent(
         category_id=category_id,
@@ -461,17 +472,18 @@ def extract_category(
             response_data=response_data,
         )
 
-        print(f"[저장] {page}/{last_page}")
+        print(f"[저장] " f"{category_name} " f"{page}/{last_page}")
 
     elapsed_time = time.perf_counter() - started_at
 
-    print("[Extract 완료] " f"batch_id={batch_id}")
+    print("[Extract 완료] " f"{category_name} " f"batch_id={batch_id}")
 
     print("[수집 시간] " f"{elapsed_time:.2f}초")
 
     return {
         "batch_id": batch_id,
         "query_category_id": category_id,
+        "query_category_name": category_name,
         "response_category_id": response_category_id,
         "response_category_name": response_category_name,
         "total_products": total_products,
@@ -486,10 +498,62 @@ def extract_category(
 
 
 # ============================================================
+# 8. 전체 카테고리 Extract
+# ============================================================
+
+
+def extract_all_categories(
+    max_workers: int = 5,
+) -> list[dict]:
+    """
+    config.py의 MUJI_CATEGORIES에 정의된
+    모든 카테고리를 순서대로 수집한다.
+
+    각 카테고리 내부 페이지는
+    ThreadPoolExecutor로 동시에 수집한다.
+    """
+
+    results = []
+
+    print()
+    print("=" * 60)
+    print("MUJI 전체 카테고리 수집 시작")
+    print("=" * 60)
+
+    for category_id, category_name in MUJI_CATEGORIES.items():
+        print()
+        print("[카테고리 시작] " f"{category_name} " f"(category_id={category_id})")
+
+        result = extract_category(
+            category_id=category_id,
+            max_workers=max_workers,
+        )
+
+        results.append(result)
+
+    print()
+    print("=" * 60)
+    print("MUJI 전체 카테고리 수집 완료")
+    print("=" * 60)
+
+    for result in results:
+        print(
+            f"{result['query_category_name']}: "
+            f"{result['total_products']:,}개 / "
+            f"{result['total_pages']}페이지 / "
+            f"{result['elapsed_seconds']:.2f}초"
+        )
+
+    return results
+
+
+# ============================================================
 # 직접 실행
 # ============================================================
 
-if __name__ == "__main__":
-    result = extract_category()
 
-    print(result)
+if __name__ == "__main__":
+    results = extract_all_categories()
+
+    print()
+    print(results)

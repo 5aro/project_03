@@ -4,31 +4,30 @@ import pendulum
 
 from airflow.sdk import dag, task
 
+from src.config import MUJI_CATEGORIES
 from src.extract import extract_category
 from src.transform import transform_batch
 
 # ============================================================
 # MUJI Korea Product Data Pipeline
 #
-# MUJI API
-#     ↓
-# Extract
-#     ↓
+# MUJI_CATEGORIES
+#       ↓
+# Extract (category)
+#       ↓
 # muji_raw
-#     ↓
+#       ↓
 # Transform + Load
-#     ↓
+#       ↓
 # muji_products / muji_inventory
-#     ↓
+#       ↓
 # Validation
 # ============================================================
 
 
 @dag(
     dag_id="muji_korea_product_pipeline",
-    # 매일 한국시간 오전 9시 실행
     schedule="0 9 * * *",
-    # DAG 기준 시간대를 Asia/Seoul로 지정
     start_date=pendulum.datetime(
         2026,
         1,
@@ -50,32 +49,27 @@ def muji_korea_product_pipeline():
     # ========================================================
 
     @task
-    def extract_task() -> dict:
+    def extract_task(category_id: int) -> dict:
         """
-        MUJI Korea API에서 상품 데이터를 수집합니다.
+        전달받은 MUJI 카테고리의 상품 데이터를 수집합니다.
 
         실제 JSON 데이터는 muji_raw에 직접 저장하고,
         XCom에는 batch_id 등 작은 메타데이터만 전달합니다.
         """
 
-        result = extract_category()
+        result = extract_category(
+            category_id=category_id,
+        )
 
         print("======================================")
-
         print("[Extract Task 완료]")
-
-        print(f"batch_id: " f"{result['batch_id']}")
-
-        print(f"요청 category_id: " f"{result['query_category_id']}")
-
-        print(f"응답 category_id: " f"{result['response_category_id']}")
-
-        print(f"응답 category_name: " f"{result['response_category_name']}")
-
-        print(f"상품 수: " f"{result['total_products']:,}")
-
-        print(f"페이지 수: " f"{result['total_pages']:,}")
-
+        print(f"batch_id: {result['batch_id']}")
+        print(f"요청 category_id: {result['query_category_id']}")
+        print(f"요청 category_name: {result['query_category_name']}")
+        print(f"응답 category_id: {result['response_category_id']}")
+        print(f"응답 category_name: {result['response_category_name']}")
+        print(f"상품 수: {result['total_products']:,}")
+        print(f"페이지 수: {result['total_pages']:,}")
         print("======================================")
 
         return result
@@ -85,39 +79,32 @@ def muji_korea_product_pipeline():
     # ========================================================
 
     @task
-    def transform_task(
-        extract_result: dict,
-    ) -> dict:
+    def transform_task(extract_result: dict) -> dict:
         """
         Extract 단계에서 생성된 batch_id를 이용해
-        muji_raw 데이터를 읽습니다.
+        raw 데이터를 정제하고 PostgreSQL에 적재합니다.
 
-        이후 데이터를 정제하여
-
-        - muji_products
-        - muji_inventory
-
-        테이블에 저장합니다.
+        Validation에 필요한 Extract 메타데이터도
+        함께 반환합니다.
         """
 
         batch_id = extract_result["batch_id"]
 
-        result = transform_batch(batch_id=batch_id)
+        result = transform_batch(
+            batch_id=batch_id,
+        )
+
+        # Validation에서 사용할 Extract 메타데이터
+        result["expected_pages"] = extract_result["total_pages"]
+        result["expected_products"] = extract_result["total_products"]
+        result["query_category_name"] = extract_result["query_category_name"]
 
         print("======================================")
-
         print("[Transform Task 완료]")
-
-        print(f"batch_id: " f"{result['batch_id']}")
-
-        print(f"snapshot_date: " f"{result['snapshot_date']}")
-
-        print(f"Raw 페이지: " f"{result['raw_pages']:,}")
-
-        print(f"처리 상품: " f"{result['products_processed']:,}")
-
-        print(f"처리 옵션: " f"{result['inventory_processed']:,}")
-
+        print(f"카테고리: {result['query_category_name']}")
+        print(f"Raw 페이지: {result['raw_pages']:,}")
+        print(f"상품 처리: {result['products_processed']:,}")
+        print(f"옵션 처리: {result['inventory_processed']:,}")
         print("======================================")
 
         return result
@@ -127,86 +114,65 @@ def muji_korea_product_pipeline():
     # ========================================================
 
     @task
-    def validate_task(
-        extract_result: dict,
-        transform_result: dict,
-    ) -> None:
+    def validate_task(transform_result: dict) -> None:
         """
-        파이프라인 실행 결과를 간단하게 검증합니다.
-
-        현재 프로젝트에서는 별도의 데이터 품질 도구를
-        사용하지 않고 기본적인 건수 검증만 수행합니다.
+        Extract 단계의 예상 수치와
+        Transform 단계의 실제 처리 결과를 비교합니다.
         """
 
-        expected_pages = extract_result["total_pages"]
-
-        expected_products = extract_result["total_products"]
+        expected_pages = transform_result["expected_pages"]
+        expected_products = transform_result["expected_products"]
 
         raw_pages = transform_result["raw_pages"]
-
         products_processed = transform_result["products_processed"]
-
         inventory_processed = transform_result["inventory_processed"]
 
-        # ----------------------------------------------------
-        # Raw 페이지 검증
-        # ----------------------------------------------------
+        category_name = transform_result["query_category_name"]
 
         if raw_pages != expected_pages:
             raise ValueError(
-                "Raw 페이지 수가 일치하지 않습니다. "
-                f"API={expected_pages}, "
-                f"DB={raw_pages}"
+                f"[{category_name}] 페이지 수 불일치: "
+                f"expected={expected_pages}, "
+                f"actual={raw_pages}"
             )
 
-        # ----------------------------------------------------
-        # 상품 수 검증
-        # ----------------------------------------------------
-
         if products_processed <= 0:
-            raise ValueError("처리된 상품이 없습니다.")
+            raise ValueError(f"[{category_name}] 처리된 상품이 없습니다.")
 
         if products_processed != expected_products:
             raise ValueError(
-                "상품 수가 일치하지 않습니다. "
-                f"API={expected_products}, "
-                f"Transform={products_processed}"
+                f"[{category_name}] 상품 수 불일치: "
+                f"expected={expected_products}, "
+                f"actual={products_processed}"
             )
 
-        # ----------------------------------------------------
-        # 옵션 데이터 검증
-        # ----------------------------------------------------
-
-        if inventory_processed <= 0:
-            raise ValueError("처리된 상품 옵션이 없습니다.")
-
-        # ----------------------------------------------------
-        # 성공
-        # ----------------------------------------------------
-
         print("======================================")
-
         print("[Validation 성공]")
-
-        print(f"Raw 페이지: " f"{raw_pages:,}")
-
-        print(f"상품: " f"{products_processed:,}")
-
-        print(f"옵션: " f"{inventory_processed:,}")
-
+        print(f"카테고리: {category_name}")
+        print(f"페이지: {raw_pages:,}")
+        print(f"상품: {products_processed:,}")
+        print(f"옵션: {inventory_processed:,}")
         print("======================================")
 
     # ========================================================
     # DAG FLOW
     # ========================================================
 
-    extract_result = extract_task()
+    category_ids = list(MUJI_CATEGORIES.keys())
 
-    transform_result = transform_task(extract_result)
+    # 4개 카테고리 → Extract 4개
+    extract_results = extract_task.expand(
+        category_id=category_ids,
+    )
 
-    validate_task(
-        extract_result,
-        transform_result,
+    # 각 Extract 결과 → Transform 1:1 매핑
+    transform_results = transform_task.expand(
+        extract_result=extract_results,
+    )
+
+    # 각 Transform 결과 → Validation 1:1 매핑
+    validate_task.expand(
+        transform_result=transform_results,
     )
 
 

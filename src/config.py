@@ -2,8 +2,12 @@ import os
 
 MUJI_API_URL = "https://mujikorea.co.kr" "/api/bff/api/products/search/list"
 
-MUJI_CATEGORY_ID = 3
-MUJI_CATEGORY_NAME = "생활"
+MUJI_CATEGORIES = {
+    2: "의복",
+    3: "생활",
+    4: "식품",
+    178: "뷰티",
+}
 
 MUJI_DISPLAY_SIZE = 16
 

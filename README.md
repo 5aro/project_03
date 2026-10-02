@@ -1,91 +1,254 @@
-# MUJI Korea Data Pipeline
+# MUJI Korea Product Data Pipeline
 
-MUJI Korea 온라인 스토어의 생활 카테고리 상품 데이터를 수집하고,
-PostgreSQL에 저장한 뒤 Airflow로 자동화하는 데이터 파이프라인 프로젝트입니다.
+MUJI Korea 온라인 스토어의 상품 데이터를 수집하고,
+PostgreSQL에 저장한 뒤 Apache Airflow로 자동화한 데이터 파이프라인 프로젝트입니다.
 
-상품 가격, 리뷰, 옵션별 재고 데이터를 일별 스냅샷으로 저장하여
-향후 가격 및 재고 변화를 분석할 수 있도록 구성했습니다.
+단순 API 수집에서 끝나지 않고
 
----
+**수집 → Raw 저장 → 정제 → 적재 → 검증 → 분석**
 
-## 1. Project Overview
-
-### 목적
-
-- 공개 API 기반 상품 데이터 수집
-- 동시 요청을 통한 수집 성능 개선
-- Raw / Processed 데이터 분리 저장
-- PostgreSQL 기반 일별 Snapshot 관리
-- Airflow를 이용한 ETL 파이프라인 자동화
-- Pandas / SQL 기반 데이터 품질 및 분포 분석
-- Window Function을 활용한 일별 변화 분석
-
-### 수집 대상
-
-- Source: MUJI Korea Online Store
-- Category: 생활
-- 수집 데이터
-  - 상품 ID / 상품명
-  - 정상가 / 판매가 / 할인율
-  - 리뷰 수 / 리뷰 평점
-  - 판매 상태
-  - 상품 옵션
-  - 옵션별 관측 재고
-
-> 재고 데이터는 API에서 수집한 시점의 관측값이며,
-> 재고 감소를 실제 판매량으로 해석하지 않습니다.
+과정을 하나의 파이프라인으로 구성했습니다.
 
 ---
 
-## 2. Architecture
+## 1. Overview
+
+MUJI Korea의 공개 상품 API에서 다음 4개 카테고리를 수집합니다.
+
+| Category | Products |
+|---|---:|
+| 의복 | 1,034 |
+| 생활 | 2,127 |
+| 식품 | 152 |
+| 뷰티 | 320 |
+| **Total** | **3,633** |
+
+최신 스냅샷 기준:
+
+- 상품 **3,633개**
+- 상품 옵션 **14,601개**
+- 상품 ID 중복 **0개**
+- 옵션 ID 중복 **0개**
+
+> API 데이터는 변경될 수 있으므로 상품 수는 수집 시점에 따라 달라질 수 있습니다.
+
+---
+
+## 2. Pipeline
 
 ```text
 MUJI Korea API
-      │
-      ▼
-Airflow Extract Task
-      │
-      ├── ThreadPoolExecutor
-      │
-      ▼
-PostgreSQL
-  └── muji_raw
-      │
-      ▼
-Airflow Transform Task
-      │
-      ├── Data Cleaning
-      └── UPSERT
-      │
-      ▼
-PostgreSQL
-  ├── muji_products
-  └── muji_inventory
-      │
-      ▼
-Airflow Validate Task
-      │
-      ▼
-SQL / Pandas Analysis
+       │
+       ▼
+    Extract
+(ThreadPoolExecutor)
+ Retry / Backoff
+       │
+       ▼
+   PostgreSQL
+    muji_raw
+       │
+       ▼
+   Transform
+  JSON → Table
+     UPSERT
+       │
+       ▼
+   PostgreSQL
+ muji_products
+ muji_inventory
+       │
+       ▼
+    Validate
+       │
+       ▼
+Jupyter Notebook
+ EDA / SQL / Chart
+```
+
+Airflow에서는 카테고리별 작업을 Dynamic Task Mapping으로 실행합니다.
+
+```text
+extract_task × 4
+       ↓
+transform_task × 4
+       ↓
+validate_task × 4
 ```
 
 ---
 
-## 3. Tech Stack
+## 3. Data Collection
 
-- Python
-- PostgreSQL 16
-- Apache Airflow 3
-- Docker / Docker Compose
-- Pandas
-- Matplotlib
-- psycopg
-- requests
-- ThreadPoolExecutor
+### Concurrent Requests
+
+MUJI API는 상품 목록을 페이지 단위로 반환합니다.
+
+각 페이지 요청이 독립적이라는 점을 이용하여
+`ThreadPoolExecutor`로 여러 페이지를 동시에 수집했습니다.
+
+10개 페이지를 대상으로 순차/동시 수집 시간을 비교한 결과:
+
+| Method | Time |
+|---|---:|
+| Sequential | 4.85 sec |
+| Concurrent | 0.62 sec |
+| **Speedup** | **7.84x** |
+
+API 요청 실패에 대응하기 위해 Retry와 Exponential Backoff도 적용했습니다.
+
+```python
+delay = 2 ** attempt
+```
+
+상품과 옵션에는 각각 `product_id`, `product_option_id`가 존재하며,
+가격·할인·리뷰·재고처럼 집계 가능한 수치 데이터도 함께 수집합니다.
 
 ---
 
-## 4. Project Structure
+## 4. Storage & Transform
+
+API 원본과 분석용 데이터를 분리하여 저장합니다.
+
+```text
+muji_raw
+└── API 페이지별 Raw JSON
+
+muji_products
+└── 상품 / 가격 / 할인 / 리뷰
+
+muji_inventory
+└── 상품 옵션 / 색상 / 사이즈 / 재고
+```
+
+Raw JSON을 보존하기 때문에 Transform 로직이 변경되더라도
+API를 다시 호출하지 않고 기존 데이터를 재처리할 수 있습니다.
+
+정제 데이터는 PostgreSQL의 Primary Key와 UPSERT를 이용하여 저장합니다.
+
+### Idempotency
+
+생활 카테고리의 동일 `batch_id`를 대상으로 Transform을 다시 실행하여
+중복 데이터가 생성되는지 확인했습니다.
+
+```text
+                Before    After
+Products         2,126    2,126
+Inventory        2,117    2,117
+```
+
+재실행 전후 행 수가 동일하게 유지되어
+동일 batch 재처리 시 중복 행이 추가되지 않는 것을 확인했습니다.
+
+---
+
+## 5. Data Quality
+
+분석 전 상품·옵션 ID의 중복과 주요 컬럼의 결측치를 확인했습니다.
+
+재고 관련 필드는 다음과 같은 차이가 있었습니다.
+
+| Metric | Missing | Negative |
+|---|---:|---:|
+| `stock` | 0 | 0 |
+| `muji_kr_inventory` | 10,779 | 0 |
+| `muji_dc_stock` | 2,235 | 633 |
+
+`stock`은 결측치와 음수 값이 없어 주요 관측 재고 지표로 사용했습니다.
+
+반면 `muji_kr_inventory`와 `muji_dc_stock`은
+결측 또는 음수 값이 존재하여 핵심 재고 분석에서는 제외했습니다.
+
+---
+
+## 6. Analysis
+
+분석은 PostgreSQL에 저장된 실제 최신 스냅샷을 사용합니다.
+
+```text
+notebooks/muji_analysis.ipynb
+```
+
+### Price
+
+| Category | Average Price | Median Price |
+|---|---:|---:|
+| 의복 | 46,968 | 29,900 |
+| 생활 | 51,690 | 9,900 |
+| 식품 | 4,549 | 3,900 |
+| 뷰티 | 7,395 | 4,500 |
+
+생활 카테고리는 평균과 중앙값의 차이가 크게 나타났습니다.
+이는 일부 고가 상품의 영향으로 가격 분포가 오른쪽으로 치우쳐 있음을 시사합니다.
+
+### Discount
+
+의복은 전체 상품의 **12.28%**가 할인 중이었으며,
+할인 상품의 평균 할인율은 **42.05%**였습니다.
+
+생활, 식품, 뷰티의 할인 상품 비율은 모두 3% 미만이었습니다.
+
+### Review
+
+전체 3,633개 상품 중 3,200개에는 리뷰가 존재했고,
+433개에는 리뷰가 없었습니다.
+
+리뷰가 없는 433개 상품은 모두 `review_score=0`으로 나타나
+본 데이터에서 평점 0은 리뷰 미등록 상태를 나타내는 값으로 판단했습니다.
+
+### Inventory
+
+| Category | Out of Stock | Low Stock (1~5) | Median Stock |
+|---|---:|---:|---:|
+| 의복 | 43.56% | 27.99% | 2 |
+| 생활 | 11.99% | 1.51% | 71 |
+| 뷰티 | 2.19% | 0.63% | 151.5 |
+
+의복은 관측 시점 기준 품절 및 저재고 옵션 비율이
+다른 카테고리보다 높게 나타났습니다.
+
+다만 `stock`은 특정 시점의 관측값이므로
+이를 실제 판매량이나 상품 인기도로 해석하지 않습니다.
+
+식품은 API에서 옵션 데이터가 제공되지 않아 재고 분석에서 제외했습니다.
+
+---
+
+## 7. SQL Analysis
+
+분석 과정에서 `COUNT`, `AVG`, `FILTER`, `PERCENTILE_CONT` 등의
+집계 함수와 Window Function을 사용했습니다.
+
+카테고리별 가격 순위:
+
+```sql
+RANK() OVER (
+    PARTITION BY query_category_id
+    ORDER BY sell_price DESC
+)
+```
+
+상품별 이전 관측 재고:
+
+```sql
+LAG(total_stock) OVER (
+    PARTITION BY product_id
+    ORDER BY snapshot_date
+)
+```
+
+현재는 하나의 날짜에 대한 재고 스냅샷만 존재하므로
+`LAG()`로 비교할 이전 데이터가 없습니다.
+
+Airflow를 통해 일별 데이터가 누적되면
+동일한 쿼리로 상품별 관측 재고 변화를 분석할 수 있습니다.
+
+Notebook에는 실제 수집 데이터를 기반으로 한
+가격 및 재고 시각화와 실행 결과를 함께 저장했습니다.
+
+---
+
+## 8. Project Structure
 
 ```text
 project_03/
@@ -112,219 +275,58 @@ project_03/
 
 ---
 
-## 5. Data Pipeline
+## 9. Tech Stack
 
-### Extract
-
-MUJI Korea API의 pagination을 확인한 뒤 전체 페이지를 수집합니다.
-
-`ThreadPoolExecutor`를 사용하여 여러 페이지를 동시에 요청하며,
-요청 실패 시 exponential backoff 방식으로 재시도합니다.
-
-```text
-API
- ↓
-Page 1 요청
- ↓
-전체 페이지 수 확인
- ↓
-Page 2 ~ N 동시 요청
- ↓
-Raw JSON 저장
-```
-
-### Transform
-
-수집된 Raw JSON을 상품과 옵션 데이터로 분리합니다.
-
-```text
-muji_raw
-   │
-   ├── Product
-   │      ↓
-   │  muji_products
-   │
-   └── Options
-          ↓
-      muji_inventory
-```
-
-### Validate
-
-수집한 페이지 수와 상품 및 옵션 수를 확인하여
-파이프라인 실행 결과를 검증합니다.
+- Python
+- PostgreSQL 16
+- Apache Airflow 3
+- Docker / Docker Compose
+- Pandas
+- Matplotlib
+- Psycopg
+- Jupyter Notebook
 
 ---
 
-## 6. Database
+## 10. Run
 
-### `muji_raw`
+프로젝트 루트에 `.env` 파일을 생성합니다.
 
-API 응답 원본 JSON을 저장합니다.
+```dotenv
+POSTGRES_USER=postgres
+POSTGRES_PASSWORD=postgres
+POSTGRES_DB=muji
+POSTGRES_DSN=postgresql://postgres:postgres@postgres:5432/muji
 
-주요 컬럼:
-
-- `batch_id`
-- `query_category_id`
-- `page`
-- `collected_at`
-- `raw_json`
-- `content_hash`
-
-### `muji_products`
-
-일별 상품 Snapshot을 저장합니다.
-
-Primary Key:
-
-```text
-(snapshot_date, product_id)
+AIRFLOW_JWT_SECRET=<your-secret>
 ```
 
-### `muji_inventory`
+`.env`는 Git에 포함하지 않습니다.
 
-일별 상품 옵션 재고 Snapshot을 저장합니다.
+Docker 환경을 실행합니다.
 
-Primary Key:
+```bash
+docker compose up -d
+```
+
+Airflow에서 다음 DAG를 실행합니다.
 
 ```text
-(snapshot_date, product_option_id)
+muji_korea_product_pipeline
+```
+
+분석 결과는 다음 Notebook에서 확인할 수 있습니다.
+
+```text
+notebooks/muji_analysis.ipynb
 ```
 
 ---
 
-## 7. Concurrency Performance
+## 11. Limitations
 
-동일한 10개 페이지를 대상으로 순차 수집과 동시 수집 성능을 비교했습니다.
-
-| Method | Time |
-|---|---:|
-| Sequential | 4.85 sec |
-| Concurrent | 0.62 sec |
-
-```text
-Speedup: 7.84x
-Workers: 5
-```
-
-동일한 API 요청 범위에서 `ThreadPoolExecutor`를 적용했을 때
-테스트 환경 기준 약 7.84배 빠른 수집 시간을 확인했습니다.
-
----
-
-## 8. Idempotency
-
-동일한 `batch_id`에 대해 Transform 작업을 다시 실행하여
-중복 데이터가 생성되는지 확인했습니다.
-
-재실행 후:
-
-```text
-muji_products
-total rows   : 2,126
-unique rows  : 2,126
-
-muji_inventory
-total rows   : 2,117
-unique rows  : 2,117
-```
-
-Primary Key와 PostgreSQL UPSERT를 사용하여
-동일 Snapshot의 파이프라인 재실행 시 중복 데이터가 증가하지 않도록 구성했습니다.
-
----
-
-## 9. Data Analysis
-
-최신 Snapshot 기준:
-
-```text
-Products : 2,126
-Options  : 2,117
-```
-
-### Price
-
-- 평균 판매가격: 약 51,536원
-- 중앙값: 9,900원
-- 최대값: 999,000원
-
-평균과 중앙값의 차이가 크며 일부 고가 상품으로 인해
-오른쪽 꼬리가 긴 가격 분포가 관찰되었습니다.
-
-### Reviews
-
-`review_count=0`, `review_score=0`인 상품이 274개 확인되었습니다.
-
-따라서 리뷰 평점 분석에서는 리뷰가 존재하는 상품과
-리뷰가 없는 상품을 구분하여 분석했습니다.
-
-### Inventory
-
-전체 2,117개 옵션 기준:
-
-| Stock Status | Options | Rate |
-|---|---:|---:|
-| Out of Stock | 252 | 11.90% |
-| Low Stock (1-5) | 33 | 1.56% |
-| Stock 6+ | 1,832 | 86.54% |
-
-`stock`에는 결측값이 없었으며 재고 분석의 주요 지표로 사용했습니다.
-
----
-
-## 10. Window Function
-
-일별 Snapshot이 누적되면 상품별 관측 재고 변화를 비교할 수 있도록
-PostgreSQL의 `LAG()` Window Function을 사용했습니다.
-
-```sql
-LAG(total_stock) OVER (
-    PARTITION BY product_id
-    ORDER BY snapshot_date
-)
-```
-
-현재 관측값과 이전 수집일의 값을 비교하여:
-
-```text
-stock_change = current_stock - previous_stock
-```
-
-을 계산합니다.
-
-재고 감소에는 판매뿐 아니라 재입고, 재고 조정, 데이터 변경 등
-여러 요인이 영향을 줄 수 있으므로 판매량으로 해석하지 않습니다.
-
----
-
-## 11. Notebook
-
-`notebooks/muji_analysis.ipynb`에서 실제 수집 데이터를 이용해 다음을 분석합니다.
-
-- 결측치
-- 수치형 데이터 분포
-- 가격 분포
-- 리뷰 데이터
-- 옵션별 재고
-- 상품별 총 관측 재고
-- 재고 상태
-- 일별 재고 변화
-
-Notebook에는 코드뿐 아니라 실행 결과와 시각화 결과도 함께 보존합니다.
-
----
-
-## 12. Limitations
-
-현재 데이터는 MUJI Korea 온라인 스토어 API에서 관측한 데이터입니다.
-
-따라서 다음과 같은 한계가 있습니다.
-
-- 실제 판매량 데이터가 아님
-- 재고 변화 원인을 직접 확인할 수 없음
-- API 필드의 내부 비즈니스 정의를 모두 알 수 없음
-- 충분한 시계열 분석을 위해서는 일별 Snapshot 누적이 필요함
-
-향후 데이터를 지속적으로 수집하여 상품별 가격 및 재고 변화 추이를
-분석할 수 있도록 확장할 예정입니다.
+- 데이터는 MUJI Korea 온라인 스토어 API의 특정 시점 스냅샷입니다.
+- 관측 재고 감소를 실제 판매량으로 해석할 수 없습니다.
+- 식품은 옵션 데이터가 제공되지 않아 재고 분석에서 제외했습니다.
+- 현재 시계열 데이터가 하루치이므로 장기적인 재고 변화 분석에는 한계가 있습니다.
+- API 데이터 변경에 따라 상품 수와 분석 결과가 달라질 수 있습니다.
