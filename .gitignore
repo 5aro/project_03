@@ -1,0 +1,22 @@
+# Environment
+.env
+.venv/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# macOS
+.DS_Store
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Airflow
+logs/
+airflow.db
+airflow.cfg
+
+# IDE
+.vscode/
