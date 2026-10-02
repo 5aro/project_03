@@ -26,10 +26,8 @@ from src.transform import transform_batch
 
 @dag(
     dag_id="muji_korea_product_pipeline",
-
     # 매일 한국시간 오전 9시 실행
     schedule="0 9 * * *",
-
     # DAG 기준 시간대를 Asia/Seoul로 지정
     start_date=pendulum.datetime(
         2026,
@@ -37,15 +35,12 @@ from src.transform import transform_batch
         1,
         tz="Asia/Seoul",
     ),
-
     catchup=False,
     max_active_runs=1,
-
     default_args={
         "retries": 2,
         "retry_delay": timedelta(minutes=2),
     },
-
     tags=["project_03", "muji", "data-pipeline"],
 )
 def muji_korea_product_pipeline():
